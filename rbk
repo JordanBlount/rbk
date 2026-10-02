@@ -1,0 +1,2519 @@
+#!/usr/bin/env python3
+"""rbk — rust-build-kit: faster, smaller Cargo builds across git worktrees.
+
+Plain Cargo underneath. No compiler wrapper, no daemon, no cache store:
+
+  rbk seed      Give this worktree's target dir the dependency layer of the
+                golden layer and the richest sibling worktree, as hardlinks.
+  rbk cargo …   Run cargo under the machine-wide heavy-build lock (and an
+                optional load gate); seed or top up the dependency layer
+                first; record which artifacts the build used; sweep when over
+                budget. `cargo test`/`bench` compile under the lock and run
+                the tests outside it. A command with nothing to compile never
+                waits for the lock.
+  rbk golden …  build | refresh | status | seed | rm: a per-session "golden"
+                dependency layer (/home/user/.rbk-golden) every new target is
+                seeded from. Never swept. Refreshed in the background when a
+                build sees a Cargo.lock it does not cover.
+  rbk sweep     Trim every worktree's target dir of this repo to a budget:
+                stale incremental sessions first, then least-recently-used
+                units.
+  rbk du        Disk per worktree target, counting shared (hardlinked) bytes once.
+  rbk timings   Recent builds from the timing log: seed / lock wait / cargo /
+                tests / sweep seconds and the slowest crate of each
+                (-n N, --here, --job [<branch>] for a per-job summary).
+  rbk doctor    Environment report and advice.
+
+After every heavy cargo command rbk prints a short timing breakdown (seed, lock
+wait, cargo, tests, sweep; units built vs fresh) and cargo's own per-crate top
+10 (from `cargo --timings`, which rbk adds; it changes neither fingerprints nor
+output), and appends the numbers to the timing log.
+
+Why only the dependency layer: registry and git crates get version-based
+("precalculated") freshness and path-independent unit hashes, so a unit built
+in worktree A is exactly what worktree B would build. Workspace path crates
+are hashed relative to the workspace root, so two worktrees produce the SAME
+unit hash for DIFFERENT sources; sharing them (a shared CARGO_TARGET_DIR or
+build-dir) lets an older-mtime source be judged fresh and silently links the
+other worktree's code. rbk never shares those, nor the registry crates that
+depend on them (e.g. a registry crate built over a [patch]ed local crate).
+
+Environment:
+  RBK_LOCK        lock file (default: /home/user/.heavy-build.lock if its
+                  directory exists, else ~/.cache/rbk/heavy-build.lock);
+                  RBK_LOCK=off disables locking
+  RBK_PRIORITY    `lead` jumps the queue: waiting jobs let a waiting lead go
+                  first (each job for at most RBK_LEAD_MAX_DEFER s, default 900)
+  RBK_PROBE=0     always wait for the lock before cargo starts (default: when
+                  the lock is busy, run cargo unlocked and stop it at its first
+                  "Compiling"/"Checking" line; fresh builds never queue)
+  RBK_SPLIT_TESTS=0  run `cargo test` in one step under the lock (default:
+                  compile with --no-run under the lock, run the tests outside)
+  RBK_LOAD_MAX    after taking the build lock, wait (up to 30 min, still holding
+                  it, so queued builds stay queued) until the 1-min load is below this
+  RBK_BUDGET      target-dir budget for the whole repo (e.g. 6G); default off.
+                  Bytes shared with the golden layer don't count.
+  RBK_TRACK=0     don't record artifact use (no --message-format injection)
+  RBK_SEED=0      don't seed / top up the dependency layer
+  RBK_GOLDEN=0    don't seed from the golden layer
+  RBK_GOLDEN_AUTO=0  never refresh the golden layer in the background after
+                  a build whose Cargo.lock it does not cover
+  RBK_GOLDEN_DIR  golden layer root (default /home/user/.rbk-golden, else
+                  ~/.cache/rbk/golden)
+  RBK_STATE_DIR   rbk's state (target registry, default timing log;
+                  default ~/.cache/rbk)
+  RBK_TIMINGS=0   don't add --timings / print the per-crate top 10
+  RBK_TIMINGS_LOG timing log (default: <RBK_STATE_DIR>/timings.jsonl)
+"""
+import fcntl, hashlib, json, os, re, shutil, signal, subprocess, sys, threading, time
+
+HEAVY = {"build", "b", "test", "t", "check", "c", "run", "r", "clippy", "bench",
+         "doc", "d", "rustc", "rustdoc", "install", "fix"}
+TRACKABLE = {"build", "b", "test", "t", "check", "c", "run", "r", "clippy", "bench", "rustc"}
+# subcommands that accept cargo's --timings (clippy/rustc are left alone)
+TIMEABLE = {"build", "b", "test", "t", "check", "c", "run", "r", "bench"}
+# cargo options before the subcommand that take a value (`cargo --config k=v build`)
+GLOBAL_WITH_VALUE = {"--config", "-Z", "-C", "--color", "--explain"}
+USED_FILE = ".rbk-used.json"
+IN_USE_FILE = ".rbk-in-use"
+GOLDEN_META = "rbk-golden.json"
+GOLDEN_CMDS = ".rbk-golden.txt"
+# env that changes what a dependency's build script produces: compared between
+# the golden layer and the build seeded from it
+GOLDEN_ENV_KEYS = ("LK_CUSTOM_WEBRTC", "LK_DEBUG_WEBRTC", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+                   "CC", "CXX", "CFLAGS", "CXXFLAGS", "CARGO_PROFILE_DEV_DEBUG")
+# rustc outputs that are always written to a temp path and renamed into place
+# (verified: rebuilding a unit gives the file a new inode), so hardlinks are safe.
+LINKABLE_EXT = (".rlib", ".rmeta", ".so", ".dylib", ".dll", ".a", ".lib", ".wasm")
+# cargo status words (stderr) that mean real compile work has started, and
+# the ones that mean the compile phase is over
+COMPILE_WORDS = {"Compiling", "Checking", "Documenting", "Scraping"}
+PAST_COMPILE = {"Finished", "Running", "Doc-tests", "Executable"}
+# every status verb cargo right-aligns on stderr (hidden again for a user's -q)
+STATUS_WORDS = COMPILE_WORDS | PAST_COMPILE | {
+    "Fresh", "Dirty", "Blocking", "Updating", "Downloading", "Downloaded", "Locking", "Adding", "Removing",
+    "Generated", "Packaging", "Verifying", "Waiting", "Unpacking", "Fetching", "Building", "Timing", "Skipping",
+    "Removed", "Packaged", "Summary", "Ignored", "Replacing", "Installing", "Installed", "Documenting"}
+STATUS_RE = re.compile(rb"^ {0,12}([A-Z][a-z]+(?:-[a-z]+)?) ")
+ANSI = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+POLL = 0.2
+
+
+def die(msg):
+    print(f"rbk: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def note(msg):
+    if os.environ.get("RBK_QUIET") != "1":
+        print(f"rbk: {msg}", file=sys.stderr, flush=True)
+
+
+def human(n):
+    for u in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or u == "T":
+            return f"{n:.1f}{u}" if u != "B" else f"{n}B"
+        n /= 1024
+
+
+def parse_size(s):
+    m = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)i?B?\s*", s, re.I)
+    if not m:
+        die(f"bad size {s!r}")
+    return int(float(m.group(1)) * 1024 ** "BKMGT".index((m.group(2) or "B").upper()))
+
+
+def state_dir():
+    d = os.environ.get("RBK_STATE_DIR")
+    if not d:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        d = os.path.join(base, "rbk")
+    return d
+
+
+def golden_root():
+    d = os.environ.get("RBK_GOLDEN_DIR")
+    if d:
+        return d
+    if os.path.isdir("/home/user"):
+        return "/home/user/.rbk-golden"
+    return os.path.join(state_dir(), "golden")
+
+
+def write_json_atomic(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+# ----------------------------------------------------------------- workspace
+def cargo_json(args, cwd):
+    r = subprocess.run(["cargo", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"cargo {' '.join(args)} failed:\n{r.stderr[-2000:]}")
+    return json.loads(r.stdout)
+
+
+def git_out(cwd, *args):
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return ""
+
+
+class Workspace:
+    def __init__(self, cwd="."):
+        meta = cargo_json(["metadata", "--format-version", "1", "--no-deps", "--offline"], cwd)
+        self.root = meta["workspace_root"]
+        self.target = meta["target_directory"]
+        self.build_dir = meta.get("build_directory") or self.target
+        self.cwd = cwd
+        self._local = self._tainted = self._branch = None
+        top = git_out(self.root, "rev-parse", "--show-toplevel")
+        self.rel = os.path.relpath(self.root, top) if top else "."
+        self.toplevel = top
+
+    # -- names cargo resolves from a path, and registry crates built on them
+    def _load_names(self):
+        """Every package cargo resolves from a path (members, path deps, [patch]
+        path overrides), and every registry/git package that depends on one
+        (transitively). Cached per Cargo.lock + Cargo.toml state."""
+        key = ""
+        for f in ("Cargo.lock", "Cargo.toml"):
+            try:
+                st = os.stat(os.path.join(self.root, f))
+                key += f"{st.st_mtime_ns}:{st.st_size};"
+            except OSError:
+                key += "-;"
+        cache = os.path.join(state_dir(), "names",
+                             hashlib.sha1(self.root.encode()).hexdigest()[:16] + ".json")
+        try:
+            c = json.load(open(cache))
+            if c.get("key") == key:
+                self._local, self._tainted = set(c["local"]), set(c["tainted"])
+                return
+        except (OSError, ValueError, KeyError):
+            pass
+        full = cargo_json(["metadata", "--format-version", "1", "--offline"], self.cwd)
+        pk = {p["id"]: p for p in full["packages"]}
+        local_ids = {i for i, p in pk.items() if p.get("source") is None}
+        deps = {n["id"]: [d["pkg"] for d in n.get("deps", [])]
+                for n in (full.get("resolve") or {}).get("nodes", [])}
+        memo = {}
+
+        def taint(i):
+            if i in memo:
+                return memo[i]
+            memo[i] = False
+            r = any(d in local_ids or taint(d) for d in deps.get(i, []))
+            memo[i] = r
+            return r
+
+        norm = lambda n: {n, n.replace("-", "_")}
+        self._local = set().union(*[norm(pk[i]["name"]) for i in local_ids]) if local_ids else set()
+        tainted = [pk[i]["name"] for i in pk if i not in local_ids and taint(i)]
+        self._tainted = set().union(*[norm(n) for n in tainted]) if tainted else set()
+        try:
+            write_json_atomic(cache, {"key": key, "local": sorted(self._local), "tainted": sorted(self._tainted)})
+        except OSError:
+            pass
+
+    @property
+    def local_names(self):
+        if self._local is None:
+            self._load_names()
+        return self._local
+
+    @property
+    def tainted(self):
+        if self._tainted is None:
+            self._load_names()
+        return self._tainted
+
+    @property
+    def branch(self):
+        if self._branch is None:
+            self._branch = git_out(self.root, "rev-parse", "--abbrev-ref", "HEAD")
+        return self._branch
+
+    @property
+    def repo_id(self):
+        common = git_out(self.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common:
+            return os.path.basename(os.path.dirname(os.path.normpath(common)))
+        return os.path.basename(self.root)
+
+    @property
+    def golden_target(self):
+        rel = "_root" if self.rel in (".", "") else self.rel.replace(os.sep, "_")
+        return os.path.join(golden_root(), self.repo_id, rel, "target")
+
+    def sibling_roots(self):
+        """Workspace roots of the same workspace in every worktree of this repo."""
+        out = git_out(self.root, "worktree", "list", "--porcelain")
+        roots = []
+        for line in out.splitlines():
+            if line.startswith("worktree "):
+                wt = line[len("worktree "):]
+                r = os.path.normpath(os.path.join(wt, self.rel))
+                if os.path.isfile(os.path.join(r, "Cargo.toml")):
+                    roots.append(r)
+        extra = os.environ.get("RBK_SIBLINGS")  # colon-separated extra roots (tests, non-git copies)
+        if extra:
+            roots += [os.path.normpath(p) for p in extra.split(":") if p]
+        return sorted(set(roots))
+
+    def sibling_targets(self):
+        """(root, target) of every worktree: its default <root>/target plus any
+        custom CARGO_TARGET_DIR it has built into through rbk (the registry).
+        The golden layer is never one of them."""
+        res, seen = [], set()
+        roots = self.sibling_roots()
+        gold = golden_root()
+        for r in roots:
+            t = os.path.join(r, "target")
+            if os.path.isdir(t):
+                res.append((r, t))
+                seen.add((r, os.path.realpath(t)))
+        for t, owners in load_registry().items():
+            if not os.path.isdir(t) or under(t, gold):
+                continue
+            for r in owners:
+                if r in roots and (r, os.path.realpath(t)) not in seen:
+                    res.append((r, t))
+                    seen.add((r, os.path.realpath(t)))
+        return [(r, t) for r, t in res if not under(os.path.realpath(t), os.path.realpath(gold))]
+
+    def shared_with(self):
+        """Other worktrees whose target is this worktree's target (unsafe)."""
+        me = os.path.realpath(self.target)
+        return sorted({r for r, t in self.sibling_targets()
+                       if os.path.realpath(t) == me and os.path.realpath(r) != os.path.realpath(self.root)})
+
+
+def under(path, root):
+    path, root = os.path.normpath(path), os.path.normpath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+# ------------------------------------------------- custom target registry
+def registry_path():
+    return os.path.join(state_dir(), "targets.json")
+
+
+def load_registry():
+    """{target dir (real path): {workspace root: last use}}"""
+    try:
+        d = json.load(open(registry_path()))
+        return {t: dict(o) for t, o in d.items() if isinstance(o, dict)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def register_target(ws):
+    """Remember a CARGO_TARGET_DIR outside <root>/target, so siblings can seed
+    from it, the sweep and `du` see it, and a second worktree using it is
+    caught."""
+    real = os.path.realpath(ws.target)
+    if real == os.path.realpath(os.path.join(ws.root, "target")) or under(real, os.path.realpath(golden_root())):
+        return
+    path = registry_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        lfd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return
+    try:
+        fcntl.flock(lfd, fcntl.LOCK_EX)
+        reg = load_registry()
+        # forget targets that are gone and owners whose worktree is gone
+        reg = {t: {r: ts for r, ts in o.items() if os.path.isfile(os.path.join(r, "Cargo.toml"))}
+               for t, o in reg.items() if os.path.isdir(t)}
+        reg.setdefault(real, {})[ws.root] = int(time.time())
+        reg = {t: o for t, o in reg.items() if o}
+        write_json_atomic(path, reg)
+    except OSError:
+        pass
+    finally:
+        os.close(lfd)
+
+
+# ------------------------------------------------------------ unit helpers
+UNIT_RE = re.compile(r"^(?:lib)?(?P<name>[A-Za-z0-9_\-]+?)-(?P<hash>[0-9a-f]{16})(?:\..*)?$")
+
+
+def unit_of(filename):
+    m = UNIT_RE.match(filename)
+    return (m.group("name"), m.group("hash")) if m else None
+
+
+def unit_key(name, h):
+    return f"{name.replace('-', '_')}-{h}"
+
+
+def profile_dirs(target):
+    """Every directory holding a .fingerprint dir (debug, release, <triple>/<profile>, ...)."""
+    out = []
+    for dirpath, dirnames, _ in os.walk(target):
+        if ".fingerprint" in dirnames:
+            out.append(dirpath)
+            dirnames[:] = []  # a profile dir never nests another
+        else:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+    return out
+
+
+def is_local(ws, name):
+    return name in ws.local_names or name.replace("-", "_") in ws.local_names
+
+
+def seedable(ws, name):
+    """A registry/git unit that no local crate feeds into."""
+    if is_local(ws, name):
+        return False
+    t = getattr(ws, "tainted", None) or set()
+    return not (name in t or name.replace("-", "_") in t)
+
+
+def seedable_hashes(ws, pdir):
+    """Hashes of the seedable units of a profile dir (from .fingerprint/)."""
+    out = set()
+    for e in _listdir(os.path.join(pdir, ".fingerprint")):
+        u = unit_of(e)
+        if u and seedable(ws, u[0]):
+            out.add(u[1])
+    return out
+
+
+def fp_units(target, profiles=None):
+    """{(profile rel dir, fingerprint entry)} of a target; profiles=None: all."""
+    out = set()
+    pdirs = ([os.path.join(target, p) for p in profiles] if profiles is not None else profile_dirs(target))
+    for pdir in pdirs:
+        rel = os.path.relpath(pdir, target)
+        for e in _listdir(os.path.join(pdir, ".fingerprint")):
+            if UNIT_RE.match(e):
+                out.add((rel, e))
+    return out
+
+
+# ------------------------------------------------------------------- seed
+def used_mtime(t):
+    for f in (USED_FILE, ".rustc_info.json"):
+        try:
+            return os.stat(os.path.join(t, f)).st_mtime
+        except OSError:
+            pass
+    return 0
+
+
+def golden_busy(g):
+    """True while `rbk golden build` is writing the golden layer."""
+    try:
+        fd = os.open(os.path.join(os.path.dirname(g), ".building"), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def golden_usable(ws):
+    if os.environ.get("RBK_GOLDEN", "1") == "0" or os.environ.get("RBK_GOLDEN_BUILDING"):
+        return None
+    g = ws.golden_target
+    if not os.path.isfile(os.path.join(os.path.dirname(g), GOLDEN_META)) or golden_busy(g):
+        return None
+    if os.path.realpath(g) == os.path.realpath(ws.target):
+        return None
+    return g
+
+
+def seed_sources(ws, profiles=None):
+    """Where to seed from, best first: the golden layer, then the sibling
+    targets, the one with the most units in the profiles this build needs
+    first (until 2026-09-30 it was only the one
+    with the newest .rustc_info.json: seeding copies that file with its mtime,
+    so every target had the same one and the pick was alphabetical --
+    2026-09-30, a seed from a sibling with a small test build)."""
+    out = []
+    g = golden_usable(ws)
+    if g:
+        out.append(g)
+    me = os.path.realpath(ws.target)
+    sibs = []
+    for _, t in ws.sibling_targets():
+        rt = os.path.realpath(t)
+        if rt == me or (g and rt == os.path.realpath(g)) or rt in [s[2] for s in sibs]:
+            continue
+        n = len(fp_units(t, profiles))
+        if n:
+            sibs.append((n, used_mtime(t), rt))
+    # every sibling, richest first: a unit only one of them has (another
+    # feature set, e.g. `test -p one-crate`) is topped up too; entries already
+    # present are skipped, so the rest cost a directory listing
+    out += [t for *_, t in sorted(sibs, reverse=True)]
+    return out
+
+
+def missing_units(ws, srcs, profiles):
+    """Seedable fingerprint entries some source has and this target lacks
+    (whole ones: an empty fingerprint dir, left by a build that died, is
+    never seeded)."""
+    have = fp_units(ws.target, profiles)
+    raw = set()
+    for s in srcs:
+        raw |= {(p, e, s) for p, e in fp_units(s, profiles) - have}
+    if not raw:
+        return set()  # the common case: no `cargo metadata` needed
+    return {(p, e) for p, e, s in raw if seedable(ws, unit_of(e)[0])
+            and _fp_own_and_deps(os.path.join(s, p, ".fingerprint", e))[2]}
+
+
+def cmd_seed(argv, ws=None, quiet=False, profiles=None, stats=None):
+    ws = ws or Workspace()
+    if argv and argv[0] == "--from":
+        srcs = [argv[1]]
+    elif argv and argv[0] == "--golden":
+        g = golden_usable(ws)
+        if not g:
+            if not quiet:
+                note(f"seed: no golden layer at {ws.golden_target} (run `rbk golden build`)")
+            return 0
+        srcs = [g]
+    else:
+        shared = ws.shared_with()
+        if shared:
+            note(f"seed: skipped: {ws.target} is also the target of {', '.join(shared)} "
+                 "(never share a target dir between worktrees)")
+            return 0
+        srcs = seed_sources(ws, profiles)
+    if not srcs:
+        if not quiet:
+            note("seed: no golden layer and no sibling worktree with a target dir; nothing to do")
+        return 0
+    for src in srcs:
+        seed_from(src, ws, quiet, profiles, stats)
+    return 0
+
+
+# Fingerprint files that are not a unit's own fingerprint hash.
+_FP_AUX = ("invoked.timestamp",)
+
+
+def _fp_own_and_deps(fpdir):
+    """(own fingerprint values, dependency fingerprint values) of one
+    .fingerprint/<unit>/ dir, as cargo writes them: the hash file (lib-serde,
+    build-script-..., run-build-script-...) holds the unit's u64 fingerprint
+    as little-endian hex; <kind>.json lists each dependency's fingerprint as
+    a u64 (the last field of its `deps` entries)."""
+    own, deps, kinds = set(), set(), set()
+    for f in _listdir(fpdir):
+        p = os.path.join(fpdir, f)
+        if f.endswith(".json"):
+            try:
+                with open(p) as fh:
+                    j = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            for d in (j.get("deps") or []) if isinstance(j, dict) else []:
+                if isinstance(d, list) and d and isinstance(d[-1], int) and 0 <= d[-1] < 2 ** 64:
+                    deps.add(d[-1].to_bytes(8, "little").hex())
+        elif f.startswith("dep-") or f in _FP_AUX or f.startswith("output-"):
+            continue
+        else:
+            kinds.add(f)
+            try:
+                with open(p, errors="replace") as fh:
+                    v = fh.read(64).strip()
+            except OSError:
+                continue
+            if re.fullmatch(r"[0-9a-f]{16}", v):
+                own.add(v)
+    return own, deps, kinds
+
+
+class _UnitView:
+    """One profile dir of a target, unit by unit (seed consistency checks)."""
+
+    def __init__(self, pdir):
+        self.pdir = pdir
+        self.files = {}  # hash -> deps/ entries
+        for e in _listdir(os.path.join(pdir, "deps")):
+            u = unit_of(e)
+            if u:
+                self.files.setdefault(u[1], []).append(e)
+        self._info = {}
+        self._by_fp = None
+
+    def entries(self):
+        return [e for e in _listdir(os.path.join(self.pdir, ".fingerprint")) if UNIT_RE.match(e)]
+
+    def info(self, entry):
+        if entry not in self._info:
+            self._info[entry] = _fp_own_and_deps(os.path.join(self.pdir, ".fingerprint", entry))
+        return self._info[entry]
+
+    def by_fp(self):
+        """fingerprint value -> entry, and fingerprint value -> entries depending on it."""
+        if self._by_fp is None:
+            own, rdeps = {}, {}
+            for e in self.entries():
+                o, d, _ = self.info(e)
+                for v in o:
+                    own[v] = e
+                for v in d:
+                    rdeps.setdefault(v, []).append(e)
+            self._by_fp = (own, rdeps)
+        return self._by_fp
+
+    def linkables(self, entry):
+        h = unit_of(entry)[1]
+        return sorted(f for f in self.files.get(h, []) if f.endswith(LINKABLE_EXT))
+
+    def wanted(self, entry):
+        """What a unit needs in deps/ to be whole: None for a unit that is
+        not (False), a set of file names, or {} when nothing is required.
+        A lib unit's dep-info (deps/<name>-<hash>.d) names the outputs rustc
+        wrote (.rlib and .rmeta for a build, .rmeta for a check, .so for a
+        proc-macro); all of them must be there, or cargo finds a fresh
+        fingerprint next to a missing file."""
+        h = unit_of(entry)[1]
+        _, _, kinds = self.info(entry)
+        if not kinds:
+            return None  # only invoked.timestamp: still compiling (or it died)
+        if not any(k.startswith("lib-") and not k.endswith(".json") for k in kinds):
+            return set()  # a build-script / bin unit: its files live in build/<entry>/
+        have = self.files.get(h, [])
+        want = set()
+        for f in have:
+            if not f.endswith(".d"):
+                continue
+            try:
+                with open(os.path.join(self.pdir, "deps", f), errors="replace") as fh:
+                    for line in fh:
+                        if ":" not in line:
+                            continue
+                        out = os.path.basename(line.split(":", 1)[0].strip())
+                        if out.endswith(LINKABLE_EXT) and h in out:
+                            want.add(out)
+            except OSError:
+                return None
+        if not want:
+            want = {f for f in have if f.endswith(LINKABLE_EXT)}
+            if not want:
+                return None
+        return want
+
+    def outputs_complete(self, entry):
+        want = self.wanted(entry)
+        return want is not None and want <= set(self.files.get(unit_of(entry)[1], []))
+
+
+def _same_file(a, b):
+    try:
+        if os.path.samefile(a, b):
+            return True
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    if sa.st_size != sb.st_size:
+        return False
+    import filecmp
+    try:
+        return filecmp.cmp(a, b, shallow=False)
+    except OSError:
+        return False
+
+
+def _same_unit(sv, dv, entry):
+    """Are a unit's compiled files in source view sv and destination view dv
+    the same build? Only then do units compiled against one fit the other:
+    crates that include!() a build-script output (serde, serde_core,
+    serde_json, ...) get a different crate hash (SVH) in every target dir,
+    because the OUT_DIR path is part of it (2026-10-01)."""
+    fs, fd = sv.linkables(entry), dv.linkables(entry)
+    if not fs:
+        return True  # nothing another unit links against
+    if fs != fd:
+        return False
+    # the .rmeta carries the crate hash; compare it (or the one artifact)
+    pick = [f for f in fs if f.endswith(".rmeta")] or fs[:1]
+    return all(_same_file(os.path.join(sv.pdir, "deps", f), os.path.join(dv.pdir, "deps", f)) for f in pick)
+
+
+def consistent_units(ws, src_pdir, dst_pdir):
+    """The seedable units of src_pdir that dst_pdir lacks and may take
+    without mixing builds (2026-10-01, the lead's "can't find crate for
+    `serde`" after golden/sibling top-ups). Rules:
+      - complete: the source unit's fingerprint hash and every output its
+        dep-info names are there (never a fresh fingerprint next to an
+        .rmeta whose .rlib is missing);
+      - forward: every dependency it was compiled against comes along from
+        the same source, or the destination's copy is the same build;
+      - reverse: nothing in the destination was compiled against another
+        build of it (a sweep evicted it under a unit that stays; re-seeding
+        another worktree's build with an older mtime would leave that unit
+        "fresh" and linking a crate hash that is no longer there). Cargo
+        rebuilds such a unit itself, and its dependents after it.
+    Returns (entries, held-back count, {entry: files it needs in deps/})."""
+    sv, dv = _UnitView(src_pdir), _UnitView(dst_pdir)
+    exists = lambda e: os.path.exists(os.path.join(dst_pdir, ".fingerprint", e))
+    cand = set()
+    for e in sv.entries():
+        u = unit_of(e)
+        if not u or not seedable(ws, u[0]) or exists(e):
+            continue
+        if sv.outputs_complete(e):
+            cand.add(e)
+    if not cand:
+        return set(), 0, {}
+    n0 = len(cand)
+    s_own, _ = sv.by_fp()
+    d_own, d_rdeps = dv.by_fp()
+    changed = True
+    while changed:
+        changed = False
+        for e in sorted(cand):
+            own, deps, _ = sv.info(e)
+            ok = True
+            for v in deps:
+                dep = s_own.get(v)
+                if dep is None:
+                    ok = False  # compiled against something the source no longer has
+                    break
+                if dep in cand or not sv.linkables(dep):
+                    continue
+                if not (exists(dep) and _same_unit(sv, dv, dep)):
+                    ok = False
+                    break
+            if ok and sv.linkables(e):
+                for v in own:
+                    for user in d_rdeps.get(v, []):
+                        if not dv.linkables(user):
+                            continue  # an executable (build script, test, bin): already linked
+                        if not (os.path.isdir(os.path.join(src_pdir, ".fingerprint", user))
+                                and _same_unit(sv, dv, user)):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+            if not ok:
+                cand.discard(e)
+                changed = True
+    return cand, n0 - len(cand), {e: sv.wanted(e) for e in cand}
+
+
+def golden_read_lock(src):
+    """A shared flock on the golden layer's .building for as long as a seed
+    reads from it: `golden build`/`refresh` (exclusive) never rewrites a unit
+    under a seed, and `golden rm` never deletes the layer under one. None if
+    src is not a golden layer; False if it is being written now."""
+    gdir = os.path.dirname(os.path.normpath(src))
+    if not os.path.isfile(os.path.join(gdir, GOLDEN_META)):
+        return None
+    try:
+        fd = os.open(os.path.join(gdir, ".building"), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return False
+
+
+def seed_from(src, ws, quiet=False, profiles=None, stats=None):
+    gfd = golden_read_lock(src)
+    if gfd is False:
+        if quiet is not True:
+            note(f"seed: skipped {src}: the golden layer is being rebuilt right now")
+        return
+    try:
+        _seed_from(src, ws, quiet, profiles, stats)
+    finally:
+        if gfd:
+            os.close(gfd)
+
+
+def _seed_from(src, ws, quiet=False, profiles=None, stats=None):
+    dst = ws.target
+    t0 = time.monotonic()
+    linked = copied = skipped = held = 0
+    pdirs = ([os.path.join(src, p) for p in profiles if os.path.isdir(os.path.join(src, p))]
+             if profiles is not None else profile_dirs(src))
+    for pdir in pdirs:
+        rel = os.path.relpath(pdir, src)
+        dp = os.path.join(dst, rel)
+        units, n_held, sv_want = consistent_units(ws, pdir, dp)
+        held += n_held
+        hashes = {unit_of(e)[1] for e in units}
+        skipped += len([e for e in _listdir(os.path.join(pdir, ".fingerprint"))
+                        if UNIT_RE.match(e) and e not in units and seedable(ws, unit_of(e)[0])
+                        and os.path.exists(os.path.join(dp, ".fingerprint", e))])
+        # Order matters: a unit's build-script dir and compiled files first,
+        # its fingerprint LAST. Cargo judges a unit by its fingerprint, so a
+        # seed interrupted half-way leaves files cargo rebuilds over, never a
+        # fresh fingerprint over missing files.
+        sd = os.path.join(pdir, "build")
+        for entry in _listdir(sd) if os.path.isdir(sd) else []:
+            if entry not in units:
+                continue
+            s, d = os.path.join(sd, entry), os.path.join(dp, "build", entry)
+            if os.path.exists(d):
+                continue
+            try:
+                # build/<pkg>-<hash>/ holds the build script binary (a rustc
+                # output, safe to link) or its out/ dir (written by the
+                # script itself, maybe in place: copy).
+                shutil.copytree(s, d, symlinks=True, copy_function=_link_or_copy_script(s))
+            except FileExistsError:
+                continue
+            except (FileNotFoundError, shutil.Error):
+                shutil.rmtree(d, ignore_errors=True)
+                units.discard(entry)
+                continue
+            copied += 1
+        sd = os.path.join(pdir, "deps")
+        if os.path.isdir(sd):
+            os.makedirs(os.path.join(dp, "deps"), exist_ok=True)
+            for entry in _listdir(sd):
+                u = unit_of(entry)
+                if not u or u[1] not in hashes:
+                    continue
+                s, d = os.path.join(sd, entry), os.path.join(dp, "deps", entry)
+                if os.path.lexists(d):
+                    # a leftover of another build of this unit here (a
+                    # cargo killed after writing the .rmeta): never pair it
+                    # with the source's files -- leave the unit to cargo
+                    if entry.endswith(LINKABLE_EXT) and not _same_file(s, d):
+                        hashes.discard(u[1])
+                    continue
+                if os.path.isdir(s) and not os.path.islink(s):
+                    # a macOS .dSYM bundle (split-debuginfo = "packed")
+                    try:
+                        shutil.copytree(s, d, symlinks=True)
+                    except FileExistsError:
+                        continue
+                    except (FileNotFoundError, shutil.Error):
+                        shutil.rmtree(d, ignore_errors=True)
+                        continue
+                    copied += 1
+                    continue
+                if entry.endswith(LINKABLE_EXT):
+                    try:
+                        os.link(s, d)
+                        linked += 1
+                        continue
+                    except FileExistsError:
+                        # a concurrent seed (or cargo) made it: never copy
+                        # over it -- it may be a hardlink shared with a sibling
+                        continue
+                    except FileNotFoundError:  # evicted from the source
+                        hashes.discard(u[1])
+                        continue
+                    except OSError:
+                        pass
+                try:
+                    shutil.copy2(s, d)
+                except shutil.SameFileError:  # a concurrent seed linked it
+                    continue
+                except FileNotFoundError:  # evicted from the source
+                    hashes.discard(u[1])
+                    continue
+                copied += 1
+        sd = os.path.join(pdir, ".fingerprint")
+        for entry in sorted(units):
+            if unit_of(entry)[1] not in hashes:
+                continue  # its files went missing mid-seed: let cargo build it
+            s, d = os.path.join(sd, entry), os.path.join(dp, ".fingerprint", entry)
+            if os.path.exists(d):
+                skipped += 1
+                continue
+            want = sv_want.get(entry)
+            if want is None or any(not os.path.exists(os.path.join(dp, "deps", f)) for f in want):
+                continue
+            try:
+                shutil.copytree(s, d, symlinks=True)
+            except FileExistsError:
+                skipped += 1
+                continue
+            except (FileNotFoundError, shutil.Error):
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            copied += 1
+    for f in (".rustc_info.json", "CACHEDIR.TAG"):
+        s = os.path.join(src, f)
+        if os.path.exists(s) and not os.path.exists(os.path.join(dst, f)):
+            os.makedirs(dst, exist_ok=True)
+            try:
+                shutil.copy2(s, os.path.join(dst, f))
+            except OSError:
+                pass
+    if stats is not None:
+        stats["linked"] = stats.get("linked", 0) + linked
+        stats["copied"] = stats.get("copied", 0) + copied
+        stats["held_back"] = stats.get("held_back", 0) + held
+        stats.setdefault("from", []).append(src)
+    # quiet="auto" (a top-up before a build): say something only when it did something
+    if not quiet or (quiet == "auto" and linked + copied):
+        note(f"seed: from {src}: {linked} files hardlinked, {copied} copied, "
+             f"{skipped} already present"
+             + (f", {held} unit(s) left for cargo (another build of a dependency here)" if held else "")
+             + f" ({time.monotonic()-t0:.2f}s)")
+
+
+def _listdir(d):
+    """os.listdir, or [] if a sweep or `git worktree remove` took the dir."""
+    try:
+        return os.listdir(d)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _link_or_copy_script(unit_dir):
+    def f(s, d):
+        base = os.path.basename(s)
+        # build-script executables are rustc/linker outputs: link
+        if base.startswith("build_script_") or base.startswith("build-script-"):
+            try:
+                os.link(s, d)
+                return d
+            except OSError:
+                pass
+        return shutil.copy2(s, d)
+    return f
+
+
+# ------------------------------------------------------------------ lock
+def default_lock():
+    if os.path.isdir("/home/user"):
+        return "/home/user/.heavy-build.lock"
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    os.makedirs(os.path.join(base, "rbk"), exist_ok=True)
+    return os.path.join(base, "rbk", "heavy-build.lock")
+
+
+def loadavg():
+    try:
+        return os.getloadavg()[0]
+    except OSError:
+        return 0.0
+
+
+def lock_holder(path):
+    """Who holds the flock on path, from /proc/locks (Linux): works for old
+    rbk, `flock` and new rbk alike. '' if unknown."""
+    try:
+        st = os.stat(path)
+        for line in open("/proc/locks"):
+            f = line.split()
+            # 1: FLOCK  ADVISORY  WRITE 1234 fd:00:5678 0 EOF   (a "->" marks waiters)
+            if len(f) < 6 or f[1] != "FLOCK" or f[2] == "->":
+                continue
+            if int(f[5].rsplit(":", 1)[-1]) != st.st_ino:
+                continue
+            pid = f[4]
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                cmd = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                return f"pid {pid}"
+            cmd = re.sub(r"^\S*python3?\S* ", "", cmd.strip())
+            cmd = re.sub(r"^\S*/rbk ", "rbk ", cmd)
+            where = cwd.replace("/home/user/", "")
+            return f"pid {pid} in {where}: {cmd[:90]}"
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _flocked(path, how):
+    """True if someone holds a lock on path that conflicts with `how`."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, how | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+class HeavyLock:
+    """The machine-wide heavy-build lock: one flock on RBK_LOCK, exactly the
+    lock older rbk and `flock` take, so they all still exclude each other.
+
+    Queueing (new rbk only, in side files next to the lock): a lead
+    (RBK_PRIORITY=lead) holds a shared flock on <lock>.lead while it waits and
+    blocks on the lock itself; a job takes a ticket in <lock>.queue/ and polls
+    the lock only when it is the oldest live ticket and no lead is waiting, so
+    jobs go first-come first-served and a lead goes before them. A job stops
+    deferring to leads after RBK_LEAD_MAX_DEFER seconds (default 900), so a
+    stream of leads cannot starve it. An old rbk blocks in flock and may win
+    a release before a polling job; that only lasts until everyone runs this
+    version."""
+
+    def __init__(self, path, prio=""):
+        self.path, self.prio, self.fd = path, prio, None
+
+    def _open(self):
+        if self.fd is None:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+
+    def try_now(self):
+        self._open()
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+
+    def lead_waiting(self):
+        return _flocked(self.path + ".lead", fcntl.LOCK_EX)
+
+    def wait(self):
+        self._open()
+        if self.try_now():
+            return
+        who = lock_holder(self.path)
+        note(f"waiting for {self.path} (another heavy build is running"
+             f"{': ' + who if who else ''})" + (" [priority: lead]" if self.prio == "lead" else ""))
+        if self.prio == "lead":
+            ifd = os.open(self.path + ".lead", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(ifd, fcntl.LOCK_SH)
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            finally:
+                os.close(ifd)
+            return
+        qdir = self.path + ".queue"
+        try:
+            os.makedirs(qdir, exist_ok=True)
+            ticket = os.path.join(qdir, f"{time.time_ns():020d}-{os.getpid()}")
+            tfd = os.open(ticket, os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(tfd, fcntl.LOCK_EX)
+        except OSError:  # no queue possible: plain blocking flock
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            return
+        max_defer = float(os.environ.get("RBK_LEAD_MAX_DEFER", "900"))
+        deferred, told = 0.0, False
+        try:
+            while True:
+                if not self._head(qdir, os.path.basename(ticket)):
+                    time.sleep(POLL)
+                    continue
+                if deferred < max_defer and self.lead_waiting():
+                    if not told:
+                        note("a lead build is waiting: letting it go first")
+                        told = True
+                    time.sleep(POLL)
+                    deferred += POLL
+                    continue
+                if self.try_now():
+                    return
+                time.sleep(POLL)
+        finally:
+            os.close(tfd)
+            try:
+                os.unlink(ticket)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _head(qdir, mine):
+        """True if no live ticket is older than mine (dead ones are removed)."""
+        for t in sorted(_listdir(qdir)):
+            if t >= mine:
+                return True
+            p = os.path.join(qdir, t)
+            if _flocked(p, fcntl.LOCK_EX):
+                return False
+            try:  # its owner died without cleaning up
+                os.unlink(p)
+            except OSError:
+                pass
+        return True
+
+    def release(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def requested_profile_dir(target, argv):
+    """The <target>/[<triple>/]<profile> dir this cargo command builds into."""
+    prof, triple = "debug", None
+    it = iter(argv)
+    for a in it:
+        if a in ("--release", "-r"):
+            prof = "release"
+        elif a == "--profile":
+            prof = next(it, "dev")
+        elif a.startswith("--profile="):
+            prof = a.split("=", 1)[1]
+        elif a == "--target":
+            triple = next(it, None)
+        elif a.startswith("--target="):
+            triple = a.split("=", 1)[1]
+        elif a == "--":
+            break
+    prof = {"dev": "debug", "test": "debug", "bench": "release"}.get(prof, prof)
+    return os.path.join(target, triple, prof) if triple else os.path.join(target, prof)
+
+
+def seed_profiles(target, argv):
+    """Profile dirs (relative) a build writes: the requested one, and with
+    --target also the host one (build scripts, proc-macros)."""
+    req = os.path.relpath(requested_profile_dir(target, argv), target)
+    host = os.path.basename(req)
+    return [req] if req == host else [req, host]
+
+
+def needs_seed(target, argv):
+    fp = os.path.join(requested_profile_dir(target, argv), ".fingerprint")
+    return not (os.path.isdir(fp) and os.listdir(fp))
+
+
+def profile_busy(target, profiles):
+    """A cargo (rbk or not) is building in one of these profile dirs."""
+    return any(_flocked(os.path.join(target, p, ".cargo-lock"), fcntl.LOCK_EX) for p in profiles)
+
+
+def insert_flag(argv, flag):
+    """argv with flag added before a `--` separator (cargo's own options end there)."""
+    if "--" in argv:
+        i = argv.index("--")
+        return argv[:i] + [flag] + argv[i:]
+    return argv + [flag]
+
+
+def subcommand(argv):
+    """cargo's subcommand: the first argument that is not an option (or the
+    value of one, e.g. `cargo --config k=v build`)."""
+    it = iter(argv)
+    for a in it:
+        if a in GLOBAL_WITH_VALUE:
+            next(it, None)
+            continue
+        if not a.startswith("-") and not a.startswith("+"):
+            return a
+    return None
+
+
+# ------------------------------------------------------------ cargo runner
+class Output:
+    """stdout/stderr writes, held back while a probe may still be discarded."""
+
+    def __init__(self, hold):
+        self.hold, self.buf, self.mu = hold, [], threading.Lock()
+
+    def write(self, stream, data):
+        with self.mu:
+            if self.hold:
+                self.buf.append((stream, data))
+                return
+        self._emit(stream, data)
+
+    @staticmethod
+    def _emit(stream, data):
+        f = sys.stdout.buffer if stream == 1 else sys.stderr.buffer
+        try:
+            f.write(data)
+            f.flush()
+        except BrokenPipeError:
+            pass
+
+    def flush(self):
+        with self.mu:
+            buf, self.buf, self.hold = self.buf, [], False
+        for s, d in buf:
+            self._emit(s, d)
+
+
+def status_word(line):
+    """cargo's status verb of a stderr line ('Compiling', ...) or ''."""
+    m = STATUS_RE.match(ANSI.sub(b"", line))
+    w = m.group(1).decode() if m else ""
+    return w if w in STATUS_WORDS else ""
+
+
+def without_quiet(argv):
+    """argv minus cargo's own -q/--quiet (not a test binary's, after `--`):
+    a quiet cargo prints no "Compiling" lines, so a probe could not see work
+    start. The probe hides the status lines itself instead."""
+    head, tail = (argv[:argv.index("--")], argv[argv.index("--"):]) if "--" in argv else (argv, [])
+    return [a for a in head if a not in ("-q", "--quiet")] + tail
+
+
+def wants_quiet(argv):
+    head = argv[:argv.index("--")] if "--" in argv else argv
+    return any(a in ("-q", "--quiet") for a in head)
+
+
+def run_cargo(args, ws=None, counts=None, track=False, probe=False, dep_keys=None):
+    """Run cargo. track: JSON messages, re-rendered, units recorded in
+    <target>/.rbk-used.json. probe: cargo runs in its own process group with
+    stderr watched and output held back; at its first "Compiling"/"Checking"
+    status line (compile work, which needs the heavy lock) the whole group is
+    killed and None is returned. Otherwise the exit status."""
+    hide_status = False
+    if probe and wants_quiet(args):
+        args, hide_status = without_quiet(args), True
+    if track:
+        args = insert_flag(args, "--message-format=json-diagnostic-rendered-ansi")
+    env = dict(os.environ)
+    if sys.stderr.isatty():
+        env.setdefault("CARGO_TERM_COLOR", "always")
+    if not track and not probe:
+        return subprocess.call(["cargo", *args], env=env)
+    if counts is not None and track:
+        counts.update(built=0, fresh=0)
+    out = Output(hold=probe)
+    state = {"aborted": False}
+    kw = {"preexec_fn": os.setpgrp} if probe else {}
+    p = subprocess.Popen(["cargo", *args], stdout=subprocess.PIPE if track else None,
+                         stderr=subprocess.PIPE if probe else None, env=env, **kw)
+    old = {}
+
+    def forward(sig, _frame):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            pass
+        raise SystemExit(128 + sig)
+
+    reader = None
+    if probe:
+        if threading.current_thread() is threading.main_thread():
+            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                old[s] = signal.signal(s, forward)
+
+        def read_err():
+            watching = True
+            for line in p.stderr:
+                if state["aborted"]:
+                    continue
+                word = status_word(line)
+                if watching:
+                    if word in COMPILE_WORDS:
+                        state["aborted"] = True
+                        try:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        continue
+                    if word in PAST_COMPILE:
+                        watching = False
+                        if not hide_status:
+                            out.write(2, line)
+                        out.flush()
+                        continue
+                if hide_status and word:
+                    continue
+                out.write(2, line)
+
+        reader = threading.Thread(target=read_err, daemon=True)
+        reader.start()
+    used = {}
+    now = int(time.time())
+    try:
+        if track:
+            for raw in p.stdout:
+                if state["aborted"]:
+                    continue
+                if raw.startswith(b"{\"reason\":"):
+                    try:
+                        m = json.loads(raw)
+                    except ValueError:
+                        out.write(1, raw)
+                        continue
+                    r = m.get("reason")
+                    if r == "compiler-message":
+                        rendered = (m.get("message") or {}).get("rendered")
+                        if rendered:
+                            out.write(2, rendered.encode())
+                    elif r == "compiler-artifact":
+                        fresh = bool(m.get("fresh"))
+                        if counts is not None:
+                            counts["fresh" if fresh else "built"] += 1
+                        pid = m.get("package_id") or ""
+                        dep = not (pid.startswith("path+") or "(path+" in pid)
+                        for f in m.get("filenames") or []:
+                            base = os.path.basename(f)
+                            if base.startswith(("build_script_", "build-script-")):
+                                # a build script: its unit is build/<pkg>-<hash>/
+                                base = os.path.basename(os.path.dirname(f))
+                            u = unit_of(base)
+                            if u:
+                                used[unit_key(*u)] = now
+                                if dep and not fresh and dep_keys is not None:
+                                    dep_keys.add(unit_key(*u))
+                    elif r == "build-script-executed":
+                        od = m.get("out_dir") or ""
+                        u = unit_of(os.path.basename(os.path.dirname(od))) if od else None
+                        if u:
+                            used[unit_key(*u)] = now
+                    continue
+                out.write(1, raw)
+        rc = p.wait()
+        if reader is not None:
+            reader.join()
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+    if state["aborted"]:
+        return None
+    out.flush()
+    if used and ws is not None:
+        path = os.path.join(ws.target, USED_FILE)
+        try:
+            prev = json.load(open(path))
+        except (OSError, ValueError):
+            prev = {}
+        prev.update(used)
+        try:
+            os.makedirs(ws.target, exist_ok=True)
+            write_json_atomic(path, prev)
+        except OSError:
+            pass
+    return rc
+
+
+def run_tracked(argv, ws, counts=None):
+    """Kept for callers of the old helper: a tracked, unprobed cargo run."""
+    return run_cargo(argv, ws, counts, track=True)
+
+
+# ------------------------------------------------------------------ cargo
+def cmd_cargo(argv):
+    sub = subcommand(argv)
+    heavy = sub in HEAVY
+    ws = None
+    tm = {"seed": 0.0, "lock": 0.0, "load": 0.0, "probe": 0.0, "cargo": 0.0, "tests": 0.0, "sweep": 0.0}
+    extra = {}
+    t_all = time.monotonic()
+    if heavy:
+        try:
+            ws = Workspace()
+        except SystemExit:
+            ws = None  # let cargo itself report the broken manifest
+    if heavy and ws is not None:
+        if os.environ.get("RBK_GOLDEN_BUILDING") is None:
+            register_target(ws)
+        shared = ws.shared_with()
+        if shared:
+            note(f"WARNING: {ws.target} is also the target dir of {', '.join(shared)}: cargo can link "
+                 "the other worktree's code into this build (workspace crates hash the same in every "
+                 "worktree). Give each worktree its own target dir. Not seeding.")
+        elif os.environ.get("RBK_SEED", "1") != "0":
+            t0 = time.monotonic()
+            maybe_seed(ws, argv, extra)
+            tm["seed"] = time.monotonic() - t0
+    lock_path = os.environ.get("RBK_LOCK") or default_lock()
+    lock = HeavyLock(lock_path, os.environ.get("RBK_PRIORITY", "").lower()) if heavy and lock_path != "off" else None
+    probe_ok = os.environ.get("RBK_PROBE", "1") != "0"
+    track = (heavy and ws is not None and sub in TRACKABLE and os.environ.get("RBK_TRACK", "1") != "0"
+             and not any(a.startswith("--message-format") for a in argv))
+    timed = (heavy and ws is not None and sub in TIMEABLE and os.environ.get("RBK_TIMINGS", "1") != "0")
+    head = argv[:argv.index("--")] if "--" in argv else argv
+    # `cargo run` may run for hours (the app): build under the lock, then
+    # release it and run (the second cargo finds everything fresh).
+    run_after = None
+    split = False
+    build_argv = argv
+    if sub in ("run", "r"):
+        i = argv.index(sub)
+        build_argv = head[:i] + ["build"] + head[i + 1:]
+        run_after = argv
+    elif (sub in ("test", "t", "bench") and os.environ.get("RBK_SPLIT_TESTS", "1") != "0"
+          and not any(a in ("--no-run", "--doc") for a in head) and lock is not None):
+        # compile under the lock, run the test binaries outside it
+        build_argv = head + ["--no-run"]
+        split = True
+    if timed and not any(a == "--timings" or a.startswith("--timings=") for a in build_argv):
+        build_argv = insert_flag(build_argv, "--timings")
+    counts, dep_keys = {}, set()
+    in_use = hold_in_use(ws.target) if heavy and ws else None
+    started = time.time()
+    rc = 0
+    try:
+        rc = locked(lambda probe: run_cargo(build_argv, ws, counts, track=track, probe=probe,
+                                            dep_keys=dep_keys),
+                    lock, tm, "cargo", probe_ok, first_try=True)
+        if lock is not None:
+            lock.release()
+        if split and rc == 0:
+            # tests only read what phase 1 built; if cargo still finds work
+            # (an edit in between), the probe stops it and it reruns locked
+            if probe_ok and not os.isatty(0) and not wants_quiet(argv):
+                rc = locked(lambda probe: run_cargo(argv, probe=probe), lock, tm, "tests",
+                            True, first_try=False)
+            else:
+                # a terminal on stdin, a quiet run (cargo passes -q on to
+                # libtest, so it can't be taken off to watch for compiles) or
+                # RBK_PROBE=0: run the tests unlocked; phase 1 built them
+                t0 = time.monotonic()
+                rc = run_cargo(argv)
+                tm["tests"] += time.monotonic() - t0
+    finally:
+        if lock is not None:
+            lock.release()
+        if in_use is not None:
+            os.close(in_use)
+    if heavy and rc == 0 and ws is not None:
+        try:
+            extra["golden_refresh"] = maybe_refresh_golden(ws)
+        except Exception as e:  # never fail a build over it
+            note(f"golden: auto-refresh check failed: {e}")
+    budget = os.environ.get("RBK_BUDGET")
+    if heavy and budget and rc == 0 and ws is not None:
+        t0 = time.monotonic()
+        cmd_sweep(["--budget", budget, "--quiet"], ws)
+        tm["sweep"] = time.monotonic() - t0
+    if heavy:
+        extra.update(check_missed_seed(ws, argv, dep_keys) if ws is not None else {})
+        extra["split"] = split
+        report_timing(ws, argv, rc, tm, time.monotonic() - t_all, counts, started if timed else None, extra)
+    if run_after is not None and rc == 0:
+        rc = subprocess.call(["cargo", *run_after])
+    return rc
+
+
+def locked(fn, lock, tm, key, probe_ok, first_try):
+    """fn(probe) under the heavy lock -- unless the lock is busy and a probe
+    shows cargo has nothing to compile. Leaves the lock held (the caller
+    releases it). tm[key] gets cargo's time, tm['lock'] the wait, tm['probe']
+    a probe that had to be thrown away."""
+    if lock is None:
+        t0 = time.monotonic()
+        rc = fn(False)
+        tm[key] += time.monotonic() - t0
+        return rc
+    if first_try and lock.try_now():
+        wait_load(tm)
+        t0 = time.monotonic()
+        rc = fn(False)
+        tm[key] += time.monotonic() - t0
+        return rc
+    if probe_ok:
+        t0 = time.monotonic()
+        rc = fn(True)
+        if rc is not None:
+            tm[key] += time.monotonic() - t0
+            return rc  # nothing to compile: never needed the lock
+        tm["probe"] += time.monotonic() - t0
+    t0 = time.monotonic()
+    lock.wait()
+    tm["lock"] += time.monotonic() - t0
+    wait_load(tm)
+    t0 = time.monotonic()
+    rc = fn(False)
+    tm[key] += time.monotonic() - t0
+    return rc
+
+
+def wait_load(tm):
+    lmax = os.environ.get("RBK_LOAD_MAX")
+    if not lmax:
+        return
+    t0 = time.monotonic()
+    waited = 0
+    while loadavg() > float(lmax) and waited < 1800:
+        if waited == 0:
+            note(f"load {loadavg():.2f} > {lmax}; waiting")
+        time.sleep(5)
+        waited += 5
+    tm["load"] += time.monotonic() - t0
+
+
+def maybe_seed(ws, argv, extra):
+    """Seed an empty target, or top up a used one with dependency units the
+    golden layer / a sibling has and it lacks (a budget sweep evicted them, or
+    it was seeded from a thinner sibling). A top-up is skipped while any cargo
+    builds in this target."""
+    profs = seed_profiles(ws.target, argv)
+    srcs = seed_sources(ws, profs)
+    if not srcs:
+        return
+    empty = needs_seed(ws.target, argv)
+    if not empty and (in_use(ws.target) or profile_busy(ws.target, profs)):
+        return
+    if not missing_units(ws, srcs, profs):
+        return
+    if not empty:
+        note("seed: topping up dependency units this target lacks (when consistent with what is here)")
+    stats = {}
+    g = golden_usable(ws)
+    if g and g in srcs:
+        warn_golden_env(g)
+    for src in srcs:
+        seed_from(src, ws, "auto", profs, stats)
+    extra["seeded"] = stats.get("linked", 0) + stats.get("copied", 0)
+
+
+def warn_golden_env(g):
+    try:
+        meta = json.load(open(os.path.join(os.path.dirname(g), GOLDEN_META)))
+    except (OSError, ValueError):
+        return
+    genv = meta.get("env") or {}
+    diff = [k for k in GOLDEN_ENV_KEYS if (os.environ.get(k) or "") != (genv.get(k) or "")]
+    if diff:
+        note("seed: the golden layer was built with " +
+             ", ".join(f"{k}={genv.get(k) or '(unset)'}" for k in diff) +
+             "; this build differs, so those dependencies' build scripts rerun")
+
+
+def check_missed_seed(ws, argv, dep_keys):
+    """How many dependency units this build compiled that the golden layer or
+    a sibling target already had (a seed that could have saved them)."""
+    res = {"deps_built": len(dep_keys)}
+    if not dep_keys:
+        return res
+    profs = seed_profiles(ws.target, argv)
+    others = []
+    g = golden_usable(ws)
+    if g:
+        others.append(g)
+    me = os.path.realpath(ws.target)
+    others += [t for _, t in ws.sibling_targets() if os.path.realpath(t) != me]
+    have = set()
+    for t in others:
+        for _, e in fp_units(t, profs):
+            u = unit_of(e)
+            if u:
+                have.add(unit_key(*u))
+    try:
+        missed = {k for k in dep_keys if k in have and seedable(ws, k.rsplit("-", 1)[0])}
+    except SystemExit:
+        missed = set()
+    res["missed"] = len(missed)
+    if len(missed) >= 5:
+        why = ("RBK_SEED=0" if os.environ.get("RBK_SEED") == "0" else
+               "the build env differs from theirs (e.g. LK_CUSTOM_WEBRTC, RUSTFLAGS), a cargo was building "
+               "in this target when it started, or a sibling built them after it started")
+        note(f"WARNING: compiled {len(missed)} dependency units that the golden layer or a sibling target "
+             f"already had ({why}). `rbk timings` marks this build with '!'.")
+    elif len(dep_keys) >= 50 and not others:
+        note(f"hint: compiled {len(dep_keys)} dependency units with nothing to seed from; "
+             "`rbk golden build` once per session makes that a hardlink copy")
+    return res
+
+
+# ---------------------------------------------------------------- timings
+def timings_log_path():
+    p = os.environ.get("RBK_TIMINGS_LOG")
+    if p:
+        return p
+    return os.path.join(state_dir(), "timings.jsonl")
+
+
+def cargo_timing_report(target, since):
+    """(facts, top10) from the cargo --timings report this build wrote."""
+    d = os.path.join(target, "cargo-timings")
+    path = os.path.join(d, "cargo-timing.html")
+    try:
+        if since is None or os.stat(path).st_mtime < since - 1:
+            return {}, []
+        html = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return {}, []
+    # cargo also keeps a timestamped copy per build: keep the newest 5
+    try:
+        old = sorted(f for f in os.listdir(d) if f.startswith("cargo-timing-") and f.endswith(".html"))
+        for f in old[:-5]:
+            os.unlink(os.path.join(d, f))
+    except OSError:
+        pass
+    facts = {}
+    for label, key in (("Fresh units", "fresh"), ("Dirty units", "dirty"), ("Total time", "total")):
+        m = re.search(r"<td>" + label + r":</td><td>([^<]*)</td>", html)
+        if m:
+            facts[key] = m.group(1).strip()
+    units = []
+    i = html.find("UNIT_DATA = ")
+    if i >= 0:
+        try:
+            units, _ = json.JSONDecoder().raw_decode(html[i + len("UNIT_DATA = "):])
+        except ValueError:
+            units = []
+    top = []
+    for u in sorted(units, key=lambda u: -float(u.get("duration") or 0))[:10]:
+        name = u.get("name", "?")
+        # " myapp \"bin\" (check)" -> ["myapp", "bin"]; a plain lib is "" or " (check)"
+        tgt = [w for w in (u.get("target") or "").replace('"', "").split() if not w.startswith("(")]
+        kind = tgt[0] if tgt else "lib"
+        if u.get("mode") == "run-custom-build" or kind == "build":
+            name += " [build.rs]"
+        elif kind != "lib":
+            name += f" [{' '.join(tgt[:2])}]"   # [bin myapp], [test remap_vectors], ...
+        top.append([name, round(float(u.get("duration") or 0), 1)])
+    return facts, top
+
+
+def report_timing(ws, argv, rc, t, total, counts, timings_since, extra=None):
+    extra = extra or {}
+    facts, top = ({}, [])
+    if timings_since is not None and ws is not None:
+        facts, top = cargo_timing_report(ws.target, timings_since)
+    built = counts.get("built", facts.get("dirty"))
+    fresh = counts.get("fresh", facts.get("fresh"))
+    parts = [f"seed {t['seed']:.1f}s", f"lock wait {t['lock']:.1f}s"]
+    if t["load"] >= 0.5:
+        parts.append(f"load wait {t['load']:.1f}s")
+    if t["probe"] >= 0.1:
+        parts.append(f"probe {t['probe']:.1f}s")
+    parts.append(f"cargo {t['cargo']:.1f}s")
+    if extra.get("split"):
+        parts.append(f"tests {t['tests']:.1f}s")
+    parts.append(f"sweep {t['sweep']:.1f}s")
+    units = f"; {built} built, {fresh} fresh" if built is not None else ""
+    note(f"timing: {total:.1f}s = " + " + ".join(parts) + units)
+    if top:
+        line, lines = "", []
+        for n, sec in top:
+            item = f"{n} {sec:.1f}s"
+            if line and len(line) + len(item) > 96:
+                lines.append(line)
+                line = ""
+            line = f"{line}, {item}" if line else item
+        lines.append(line)
+        note("slowest crates: " + lines[0])
+        for l in lines[1:]:
+            note("                " + l)
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "root": ws.root if ws else os.getcwd(),
+           "branch": ws.branch if ws else "", "cmd": " ".join(argv)[:200], "rc": rc, "total_s": round(total, 2),
+           **{f"{k}_s": round(v, 2) for k, v in t.items()}, "built": built, "fresh": fresh, "top": top,
+           "prio": os.environ.get("RBK_PRIORITY", ""),
+           **{k: v for k, v in extra.items() if k in ("seeded", "deps_built", "missed", "split", "golden_refresh")}}
+    try:
+        p = timings_log_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def worktree_branches(cwd="."):
+    """{worktree path: branch} from `git worktree list` (for log rows written
+    before rows carried their branch)."""
+    out = git_out(cwd, "worktree", "list", "--porcelain")
+    res, wt = {}, None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            wt = line[len("worktree "):]
+        elif line.startswith("branch ") and wt:
+            res[wt] = line[len("branch "):].replace("refs/heads/", "")
+    return res
+
+
+def row_branch(r, branches):
+    if r.get("branch"):
+        return r["branch"]
+    root = r.get("root", "")
+    for wt, b in branches.items():
+        if under(root, wt):
+            return b
+    return ""
+
+
+def cmd_timings(argv):
+    n = 20
+    if "-n" in argv:
+        n = int(argv[argv.index("-n") + 1])
+    here = job = None
+    if "--here" in argv:
+        here = Workspace().root
+    if "--job" in argv:
+        i = argv.index("--job")
+        job = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") else ""
+        if not job:
+            job = Workspace().branch
+    rows = []
+    try:
+        for line in open(timings_log_path()):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if here and r.get("root") != here:
+                continue
+            rows.append(r)
+    except OSError:
+        print(f"no timing log yet ({timings_log_path()})")
+        return 0
+    if job is not None:
+        branches = worktree_branches()
+        rows = [r for r in rows if row_branch(r, branches) == job or
+                (not r.get("branch") and os.path.basename(os.path.dirname(r.get("root", ""))) == job)]
+        return job_summary(job, rows)
+    rows = rows[-n:]
+    print(f"{'when':<19} {'worktree':<16} {'total':>7} {'seed':>5} {'lock':>6} {'cargo':>7} {'tests':>6} "
+          f"{'sweep':>5} {'built':>5} {'deps':>5}  {'slowest crate':<28} command")
+    for r in rows:
+        wt = os.path.basename(os.path.dirname(r.get("root", ""))) or r.get("root", "")
+        slow = f"{r['top'][0][0]} {r['top'][0][1]:.0f}s" if r.get("top") else ""
+        deps = r.get("deps_built")
+        flag = "!" if (r.get("missed") or 0) >= 5 else " "
+        print(f"{r.get('ts', ''):<19} {wt[:16]:<16} {r.get('total_s', 0):>6.0f}s {r.get('seed_s', 0):>4.0f}s "
+              f"{r.get('lock_s', 0):>5.0f}s {r.get('cargo_s', 0):>6.0f}s {r.get('tests_s', 0):>5.0f}s "
+              f"{r.get('sweep_s', 0):>4.0f}s "
+              f"{str(r.get('built') if r.get('built') is not None else ''):>5} "
+              f"{str(deps) if deps is not None else '':>5}{flag} {slow[:28]:<28} "
+              f"{r.get('cmd', '')[:60]}{'' if r.get('rc', 0) == 0 else '  (failed)'}")
+    if rows:
+        tot = sum(r.get("total_s", 0) for r in rows)
+        lock = sum(r.get("lock_s", 0) for r in rows)
+        print(f"{len(rows)} builds, {tot / 60:.1f} min in total, {lock / 60:.1f} min of it waiting for the lock")
+        if any(r.get("missed", 0) >= 5 for r in rows):
+            print("! = compiled 5+ dependency units the golden layer or a sibling already had (seed missed)")
+    return 0
+
+
+def job_summary(job, rows):
+    """A paste-ready per-stage summary of one job's rbk builds."""
+    if not rows:
+        print(f"no rbk builds logged for job {job!r} ({timings_log_path()})")
+        return 0
+    s = lambda k: sum(r.get(k, 0) or 0 for r in rows)
+    m = lambda k: s(k) / 60
+    other = s("total_s") - sum(s(k) for k in ("seed_s", "lock_s", "load_s", "probe_s", "cargo_s", "tests_s",
+                                              "sweep_s"))
+    cold = [r for r in rows if (r.get("deps_built") or 0) >= 50 or
+            any("[build.rs]" in n and ("webrtc-sys" in n or "aws-lc-sys" in n) for n, _ in r.get("top") or [])]
+    missed = [r for r in rows if (r.get("missed") or 0) >= 5]
+    failed = [r for r in rows if r.get("rc", 0) != 0]
+    slow = max(((n, sec) for r in rows for n, sec in (r.get("top") or [])[:1]), key=lambda x: x[1], default=None)
+    wts = sorted({os.path.basename(os.path.dirname(r.get("root", ""))) for r in rows})
+    print(f"rbk timings for job {job} ({', '.join(wts)}), {rows[0].get('ts', '')[:16]} to "
+          f"{rows[-1].get('ts', '')[:16]}: {len(rows)} rbk cargo runs, {m('total_s'):.1f} min")
+    stages = [("compile", m("cargo_s")), ("lock wait", m("lock_s") + m("load_s")), ("tests", m("tests_s")),
+              ("seed", m("seed_s")), ("probe", m("probe_s")), ("sweep", m("sweep_s")), ("other", other / 60)]
+    print("  " + " | ".join(f"{k} {v:.1f} min" for k, v in stages if v >= 0.05 or k in ("compile", "lock wait")))
+    print(f"  cold dependency builds: {len(cold)}; seed missed: {len(missed)}; failed runs: {len(failed)}"
+          + (f"; slowest unit: {slow[0]} {slow[1]:.0f}s" if slow else ""))
+    print("  (sim / picture time: from the sim's own summary; add it by hand)")
+    return 0
+
+
+# ------------------------------------------------------------------ sweep
+def walk_files(path):
+    for dp, dn, fn in os.walk(path):
+        for f in fn:
+            yield os.path.join(dp, f)
+
+
+def inodes(paths):
+    s = set()
+    for root in paths:
+        for f in walk_files(root):
+            try:
+                st = os.lstat(f)
+            except OSError:
+                continue
+            s.add((st.st_dev, st.st_ino))
+    return s
+
+
+def unique_bytes(paths, skip=None):
+    """Disk blocks of every file under paths, each inode once; inodes in skip
+    (the golden layer's) are not counted: they cost these targets nothing."""
+    seen, total = set(skip or ()), 0
+    for root in paths:
+        for f in walk_files(root):
+            try:
+                st = os.lstat(f)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            total += st.st_blocks * 512
+    return total
+
+
+class Unit:
+    __slots__ = ("key", "paths", "last")
+
+    def __init__(self, key):
+        self.key, self.paths, self.last = key, [], 0
+
+
+def collect_units(targets):
+    """Map unit hash -> Unit across all target dirs (a unit shared by
+    hardlinks in several worktrees is one Unit with all its paths). Keyed by
+    the 16-hex hash alone: a lib named unlike its package (rustls-webpki ->
+    libwebpki-<h>.rlib) used to be two units, its fingerprint and its rlib
+    evicted separately."""
+    units = {}
+    for t in targets:
+        used = {}
+        try:
+            for k, v in json.load(open(os.path.join(t, USED_FILE))).items():
+                h = k.rsplit("-", 1)[-1]
+                used[h] = max(used.get(h, 0), v)
+        except (OSError, ValueError, AttributeError):
+            pass
+        for pdir in profile_dirs(t):
+            for sub in ("deps", ".fingerprint", "build", "incremental"):
+                sd = os.path.join(pdir, sub)
+                if not os.path.isdir(sd):
+                    continue
+                for entry in _listdir(sd):
+                    u = unit_of(entry)
+                    if not u:
+                        continue
+                    key = u[1]
+                    p = os.path.join(sd, entry)
+                    unit = units.setdefault(key, Unit(key))
+                    unit.paths.append(p)
+                    try:
+                        mt = os.lstat(p).st_mtime
+                    except OSError:
+                        mt = 0
+                    unit.last = max(unit.last, used.get(key, 0), mt)
+    return units
+
+
+def rm(p):
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def prune_incremental(targets, dry):
+    """Keep only the newest session per incremental crate dir; rustc only
+    ever reuses the latest one."""
+    freed = []
+    for t in targets:
+        for pdir in profile_dirs(t):
+            inc = os.path.join(pdir, "incremental")
+            if not os.path.isdir(inc):
+                continue
+            for crate in _listdir(inc):
+                cd = os.path.join(inc, crate)
+                if not os.path.isdir(cd):
+                    continue
+                sessions = [s for s in _listdir(cd) if s.startswith("s-") and not s.endswith(".lock")]
+                if len(sessions) <= 1:
+                    continue
+                try:
+                    sessions.sort(key=lambda s: os.stat(os.path.join(cd, s)).st_mtime)
+                except OSError:
+                    continue
+                for s in sessions[:-1]:
+                    p = os.path.join(cd, s)
+                    freed.append(p)
+                    if not dry:
+                        rm(p)
+                        rm(p + ".lock")
+    return freed
+
+
+def distinct_dirs(paths):
+    """Real paths, each directory once. `<root>/target` may be a symlink to
+    CARGO_TARGET_DIR (or two worktrees may share one): the same dir under two
+    names used to be swept, counted and locked twice (2026-09-30 hang)."""
+    out = []
+    for p in paths:
+        r = os.path.realpath(p)
+        if r not in out:
+            out.append(r)
+    return out
+
+
+def lock_targets(targets):
+    """Hold cargo's own build locks on every profile dir while sweeping.
+
+    Never wait for one while holding others: cargo takes several in its own
+    order (`--target T` locks debug/ and then T/debug/, holding the first
+    while it waits), so a sweep waiting in readdir order deadlocked with it
+    (2026-09-30 load test). Take them all without blocking; if one is busy,
+    drop everything, wait for that one alone, and start over."""
+    paths, seen = [], set()
+    for t in targets:
+        for pdir in profile_dirs(t):
+            lp = os.path.realpath(os.path.join(pdir, ".cargo-lock"))
+            # flock is per open file: locking one file through a second fd
+            # blocks on our own first lock forever.
+            if lp in seen:
+                continue
+            seen.add(lp)
+            paths.append(lp)
+    while True:
+        fds, busy = [], None
+        for lp in paths:
+            # Create it if missing, as cargo does: a seeded profile dir has
+            # none until cargo first runs there, and a cargo starting during
+            # the sweep would otherwise build while we evict its units.
+            try:
+                fd = os.open(lp, os.O_RDWR | os.O_CREAT, 0o644)
+            except FileNotFoundError:  # its worktree was just removed
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                busy = fd
+                break
+            fds.append(fd)
+        if busy is None:
+            return fds
+        for fd in fds:
+            os.close(fd)
+        fcntl.flock(busy, fcntl.LOCK_EX)  # holding nothing else
+        os.close(busy)
+
+
+def hold_in_use(target):
+    """A shared flock on <target>/.rbk-in-use for as long as cargo runs.
+    Cargo drops .cargo-lock once it has compiled and only then runs the test
+    binaries and doctests (which read the dependency rlibs); the sweep leaves
+    a target alone while anyone holds this."""
+    try:
+        os.makedirs(target, exist_ok=True)
+        fd = os.open(os.path.join(target, IN_USE_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    fcntl.flock(fd, fcntl.LOCK_SH)  # a sweep only ever probes it, never holds it
+    return fd
+
+
+def in_use(target):
+    return _flocked(os.path.join(target, IN_USE_FILE), fcntl.LOCK_EX)
+
+
+def golden_inodes(ws):
+    g = ws.golden_target if ws is not None else None
+    return inodes([g]) if g and os.path.isdir(g) else set()
+
+
+def cmd_sweep(argv, ws=None):
+    dry = "--dry-run" in argv
+    quiet = "--quiet" in argv
+    budget = None
+    max_age = None
+    if "--budget" in argv:
+        budget = parse_size(argv[argv.index("--budget") + 1])
+    if "--max-age-days" in argv:
+        max_age = float(argv[argv.index("--max-age-days") + 1]) * 86400
+    ws = ws or Workspace()
+    targets = [t for _, t in ws.sibling_targets()]
+    if os.path.isdir(ws.target):
+        targets.append(ws.target)
+    gold = os.path.realpath(golden_root())
+    targets = [t for t in distinct_dirs(targets) if not under(t, gold)]
+    # bytes the golden layer holds cost the worktrees nothing, and evicting
+    # a unit linked from it frees nothing (the next build relinks it)
+    ginodes = golden_inodes(ws)
+    before = unique_bytes(targets, ginodes)
+    if budget is not None and before <= budget and max_age is None:
+        return 0
+    fds = [] if dry else lock_targets(targets)
+    # checked with every cargo lock held: a target still in use now is one
+    # whose cargo is past compiling and running tests (2026-09-30 load test)
+    busy = [t for t in targets if in_use(t)]
+    try:
+        prune_incremental([t for t in targets if t not in busy], dry)
+        units = collect_units([t for t in targets if t not in busy])
+        now = time.time()
+        evicted = 0
+
+        def golden_linked(u):
+            for p in u.paths:
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if not os.path.isdir(p) and (st.st_dev, st.st_ino) in ginodes:
+                    return True
+            return False
+
+        order = sorted(units.values(), key=lambda u: u.last)
+        if max_age is not None:
+            for u in order:
+                if now - u.last > max_age and not golden_linked(u):
+                    evicted += 1
+                    for p in u.paths:
+                        if not dry:
+                            rm(p)
+        if budget is not None:
+            cur = unique_bytes(targets, ginodes)
+            for u in order:
+                if cur <= budget:
+                    break
+                if now - u.last < float(os.environ.get("RBK_PROTECT_S", "60")):
+                    # never evict what the current build just used
+                    continue
+                if ginodes and golden_linked(u):
+                    continue
+                size = unique_bytes([p for p in u.paths if os.path.isdir(p)], ginodes) + sum(
+                    os.lstat(p).st_blocks * 512 for p in u.paths
+                    if os.path.lexists(p) and not os.path.isdir(p) and os.lstat(p).st_nlink <= len(u.paths))
+                evicted += 1
+                if not dry:
+                    for p in u.paths:
+                        rm(p)
+                cur -= size
+    finally:
+        for fd in fds:
+            os.close(fd)
+    after = unique_bytes(targets, ginodes)
+    if not quiet or before - after > 0:
+        note(f"sweep: {human(before)} -> {human(after)} across {len(targets)} target dir(s)"
+             f"{' (dry run)' if dry else ''}; {evicted} unit(s) evicted"
+             f"{f'; {len(busy)} in use, left alone' if busy else ''}"
+             f"{'; golden-layer bytes not counted' if ginodes else ''}")
+    return 0
+
+
+# ------------------------------------------------------------------ golden
+def read_golden_cmds(ws, argv, missing_ok=False):
+    """Cargo command lines for the golden layer: after `--` on the command
+    line (`;`-separated), else <workspace>/.rbk-golden.txt. `setenv K=V` lines
+    set K for the golden build (and are recorded) when it is unset.
+    missing_ok: no list file = ([], {}) instead of dying."""
+    cmds, env = [], {}
+    if "--" in argv:
+        cur = []
+        for a in argv[argv.index("--") + 1:]:
+            if a == ";":
+                if cur:
+                    cmds.append(cur)
+                cur = []
+            else:
+                cur.append(a)
+        if cur:
+            cmds.append(cur)
+        return cmds, env
+    path = os.path.join(ws.root, GOLDEN_CMDS)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        if missing_ok:
+            return [], {}
+        die(f"golden: no commands: pass them after `--` or write {path}")
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("setenv "):
+            k, _, v = line[len("setenv "):].partition("=")
+            env[k.strip()] = os.path.expandvars(v.strip())
+        else:
+            cmds.append(line.split())
+    return cmds, env
+
+
+def cmd_golden(argv):
+    what = argv[0] if argv else "status"
+    ws = Workspace()
+    g = ws.golden_target
+    gdir = os.path.dirname(g)
+    if what == "status":
+        return golden_status(ws)
+    if what == "seed":
+        return cmd_seed(["--golden"], ws)
+    if what == "rm":
+        if os.path.isdir(gdir):
+            bfd = golden_write_lock(gdir, wait=float(os.environ.get("RBK_GOLDEN_WAIT_S", "60")))
+            if bfd is None:
+                die("golden: in use (a seed is reading it, or a golden build/refresh runs); try again")
+            try:
+                shutil.rmtree(gdir)
+            finally:
+                os.close(bfd)
+            note(f"golden: removed {gdir}")
+        return 0
+    if what == "refresh":
+        return golden_refresh(ws)
+    if what != "build":
+        die("usage: rbk golden build [--force] [-- <cargo args> ; <cargo args> ...] | refresh | status | seed | rm")
+    cmds, genv = read_golden_cmds(ws, argv[1:])
+    st = os.statvfs(ws.root)
+    free = st.f_bavail * st.f_frsize
+    need = parse_size(os.environ.get("RBK_GOLDEN_MIN_FREE", "3G"))
+    if free < need and "--force" not in argv:
+        die(f"golden: only {human(free)} free (< {human(need)}); free disk or pass --force")
+    os.makedirs(gdir, exist_ok=True)
+    if _flocked(os.path.join(gdir, ".refresh"), fcntl.LOCK_EX):
+        die("golden: a background `rbk golden refresh` is running (it yields to lead builds); try again")
+    # seeds hold .building shared while they read (seconds): wait them out
+    bfd = golden_write_lock(gdir, wait=float(os.environ.get("RBK_GOLDEN_WAIT_S", "60")))
+    if bfd is None:
+        die("golden: another `rbk golden build` is running (or seeds keep reading it)")
+    t0 = time.time()
+    env = dict(os.environ)
+    for k, v in genv.items():
+        env.setdefault(k, v)
+    env["CARGO_TARGET_DIR"] = g
+    env["RBK_GOLDEN_BUILDING"] = "1"
+    env.pop("RBK_BUDGET", None)       # never sweep the golden layer
+    env.pop("CARGO_BUILD_BUILD_DIR", None)
+    rc = 0
+    try:
+        for c in cmds:
+            note(f"golden: cargo {' '.join(c)}")
+            rc = subprocess.call([sys.executable, os.path.abspath(__file__), "cargo", *c], cwd=ws.root, env=env)
+            if rc != 0:
+                note(f"golden: `cargo {' '.join(c)}` failed ({rc}); the layer is kept but not pruned")
+                break
+        if rc == 0:
+            pruned = golden_prune(ws, g, t0)
+            note(f"golden: pruned {pruned} local / unused / non-unit entries")
+        meta = {"built_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "from": ws.root, "branch": ws.branch,
+                "cmds": [" ".join(c) for c in cmds], "rc": rc, "seconds": round(time.time() - t0, 1),
+                "env": {k: env.get(k, "") for k in GOLDEN_ENV_KEYS if env.get(k)}}
+        meta.update(_lock_fields(gdir, file_sha(os.path.join(ws.root, "Cargo.lock")), rc == 0))
+        write_json_atomic(os.path.join(gdir, GOLDEN_META), meta)
+    finally:
+        os.close(bfd)
+    golden_status(ws)
+    return rc
+
+
+def golden_write_lock(gdir, wait=60.0):
+    """The exclusive flock on <gdir>/.building (golden build / refresh / rm),
+    polled for up to `wait` s: seeds hold it shared while they read. None if
+    it could not be had."""
+    os.makedirs(gdir, exist_ok=True)
+    fd = os.open(os.path.join(gdir, ".building"), os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(POLL)
+
+
+def _lock_fields(gdir, sha, ok):
+    """lock_sha / lock_shas for the golden meta: every Cargo.lock state the
+    layer holds the units of (units of older states stay, so a branch that
+    is still on an older lock keeps seeding)."""
+    try:
+        with open(os.path.join(gdir, GOLDEN_META)) as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        old = {}
+    shas = [x for x in (old.get("lock_shas") or ([old["lock_sha"]] if old.get("lock_sha") else [])) if x]
+    if ok and sha and sha not in shas:
+        shas.append(sha)
+    return {"lock_sha": sha if ok else old.get("lock_sha", ""), "lock_shas": shas[-12:]}
+
+
+def golden_meta(ws):
+    try:
+        with open(os.path.join(os.path.dirname(ws.golden_target), GOLDEN_META)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def golden_covers_lock(meta, sha):
+    if not meta or not sha:
+        return True  # no golden layer (nothing to refresh) or no Cargo.lock
+    shas = meta.get("lock_shas") or ([meta["lock_sha"]] if meta.get("lock_sha") else [])
+    return not shas or sha in shas
+
+
+def golden_missing_cmds(ws, meta):
+    """Commands of this worktree's .rbk-golden.txt the layer was never built
+    with (the golden list grew or changed), as the meta's `cmds` strings."""
+    if not meta:
+        return []
+    cmds, _ = read_golden_cmds(ws, [], missing_ok=True)
+    have = set(meta.get("cmds") or [])
+    return [" ".join(c) for c in cmds if " ".join(c) not in have]
+
+
+def golden_want(ws, meta):
+    """(covered, key): whether the layer covers this worktree's Cargo.lock AND
+    its golden list; key names that state (refresh.json's `sha`)."""
+    sha = file_sha(os.path.join(ws.root, "Cargo.lock"))
+    missing = golden_missing_cmds(ws, meta)
+    key = sha if not missing else f"{sha}+cmds:{hashlib.sha256(chr(10).join(missing).encode()).hexdigest()[:12]}"
+    return golden_covers_lock(meta, sha) and not missing, key, sha
+
+
+# ------------------------------------------------- golden auto-refresh (2026-10-01)
+# A Cargo.lock change (a new dependency, an upgrade) used to leave every job
+# compiling the changed units in its own target until someone ran `rbk golden
+# build`. Now the first successful `rbk cargo` that sees its Cargo.lock is not
+# one the golden layer was built for starts `rbk golden refresh` in the
+# background:
+#   - it queues for the heavy-build lock as a JOB (leads go first), and while
+#     it holds the lock it watches for a waiting lead build and stops its cargo
+#     for it (seconds, not the rest of the build); it retries after the next
+#     build;
+#   - it takes .building exclusively only once it has the heavy lock, after
+#     seeds reading the layer finish (they hold it shared), so the layer is
+#     never rewritten or deleted under a seed, and seeds skip it only while
+#     the refresh compiles;
+#   - it builds incrementally in place (golden's own env, the same commands as
+#     `golden build`), first topping the layer up from the sibling targets
+#     (the job's target just compiled the new units), never deletes it, and
+#     records the new Cargo.lock in lock_shas.
+# RBK_GOLDEN_AUTO=0 turns it off; one refresh at a time (.refresh flock); a
+# failed refresh is retried after 30 min, a yielded one after the next build.
+REFRESH_STATE = "refresh.json"
+REFRESH_YIELDED = 75
+
+
+def _refresh_state(gdir):
+    try:
+        with open(os.path.join(gdir, REFRESH_STATE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def maybe_refresh_golden(ws):
+    """After a successful build: start a background `rbk golden refresh` if
+    this worktree's Cargo.lock is not one the golden layer covers."""
+    if os.environ.get("RBK_GOLDEN_AUTO", "1") == "0" or os.environ.get("RBK_GOLDEN_BUILDING") \
+            or os.environ.get("RBK_GOLDEN", "1") == "0":
+        return None
+    meta = golden_meta(ws)
+    if meta is None:
+        return None
+    covered, key, sha = golden_want(ws, meta)
+    if covered:
+        return None
+    gdir = os.path.dirname(ws.golden_target)
+    if _flocked(os.path.join(gdir, ".refresh"), fcntl.LOCK_EX):
+        return "running"
+    st = _refresh_state(gdir)
+    if st.get("sha") == key:
+        age = time.time() - float(st.get("at", 0))
+        if st.get("rc") is None and age < 6 * 3600 and _pid_alive(st.get("pid")):
+            return "running"
+        if st.get("rc") not in (None, 0, REFRESH_YIELDED) and age < float(os.environ.get("RBK_GOLDEN_RETRY_S", "1800")):
+            return "failed recently"
+    log = os.path.join(state_dir(), "golden-refresh.log")
+    env = dict(os.environ)
+    for k in ("RBK_PRIORITY", "RBK_BUDGET", "CARGO_TARGET_DIR", "RBK_QUIET"):
+        env.pop(k, None)
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        with open(log, "ab") as lf:
+            lf.write(f"\n=== {time.strftime('%Y-%m-%dT%H:%M:%S')} refresh for {ws.root} (Cargo.lock {sha}, list {'same' if key == sha else 'changed'})\n".encode())
+            lf.flush()
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "golden", "refresh"], cwd=ws.root,
+                                 env=env, stdin=subprocess.DEVNULL, stdout=lf, stderr=lf, start_new_session=True)
+        write_json_atomic(os.path.join(gdir, REFRESH_STATE), {"sha": key, "at": time.time(), "pid": p.pid, "rc": None})
+    except OSError as e:
+        note(f"golden: could not start the background refresh: {e}")
+        return None
+    what = "this Cargo.lock is newer than the golden layer's" if key == sha else \
+        ("the golden list (.rbk-golden.txt) has commands the layer was not built with"
+         if golden_covers_lock(meta, sha) else "this Cargo.lock and the golden list are newer than the layer's")
+    note(f"golden: {what}; refreshing it in the background "
+         f"(job priority, yields to lead builds; log {log})")
+    return "started"
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def golden_refresh(ws):
+    """`rbk golden refresh`: bring the golden layer up to this worktree's
+    Cargo.lock, incrementally, in place. See the block comment above."""
+    g = ws.golden_target
+    gdir = os.path.dirname(g)
+    meta = golden_meta(ws)
+    covered, key, sha = golden_want(ws, meta) if meta is not None else (True, "", "")
+
+    def record(rc):
+        try:
+            write_json_atomic(os.path.join(gdir, REFRESH_STATE),
+                              {"sha": key, "at": time.time(), "pid": os.getpid(), "rc": rc})
+        except OSError:
+            pass
+        return 0 if rc in (0, REFRESH_YIELDED) else rc
+
+    if meta is None:
+        note("golden refresh: no golden layer to refresh (build one with `rbk golden build`)")
+        return 0
+    if covered:
+        note("golden refresh: the layer already covers this Cargo.lock and golden list")
+        return record(0)
+    st = os.statvfs(gdir)
+    need = parse_size(os.environ.get("RBK_GOLDEN_MIN_FREE", "3G"))
+    if st.f_bavail * st.f_frsize < need:
+        note(f"golden refresh: less than {human(need)} free; not refreshing (retried after RBK_GOLDEN_RETRY_S)")
+        return record(28)
+    rfd = os.open(os.path.join(gdir, ".refresh"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(rfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(rfd)
+        note("golden refresh: another refresh is running")
+        return 0
+    lock_path = os.environ.get("RBK_LOCK") or default_lock()
+    heavy = HeavyLock(lock_path, "") if lock_path != "off" else None
+    bfd = None
+    try:
+        if heavy is not None:
+            heavy.wait()  # as a job: leads go first
+        meta = golden_meta(ws)
+        if golden_want(ws, meta)[0]:
+            return record(0)
+        bfd = golden_write_lock(gdir, wait=float(os.environ.get("RBK_GOLDEN_WAIT_S", "60")))
+        if bfd is None:
+            note("golden refresh: the layer stayed busy (seeds / a golden build); will retry")
+            return record(REFRESH_YIELDED)
+        cmds, genv = read_golden_cmds(ws, [])
+        env = dict(os.environ)
+        # the layer's own build env, so its units stay what jobs expect
+        for k in GOLDEN_ENV_KEYS:
+            env.pop(k, None)
+        env.update((meta.get("env") or {}))
+        for k, v in genv.items():
+            env.setdefault(k, v)
+        env.update(CARGO_TARGET_DIR=g, RBK_GOLDEN_BUILDING="1", RBK_LOCK="off", RBK_GOLDEN_AUTO="0")
+        for k in ("RBK_BUDGET", "CARGO_BUILD_BUILD_DIR", "RBK_PRIORITY"):
+            env.pop(k, None)
+        t0 = time.time()
+        rc = 0
+        for c in cmds:
+            note(f"golden refresh: cargo {' '.join(c)}")
+            rc = _run_yielding([sys.executable, os.path.abspath(__file__), "cargo", *c], ws.root, env, heavy)
+            if rc == REFRESH_YIELDED:
+                note("golden refresh: a lead build is waiting: stopped, will retry after the next build")
+                return record(REFRESH_YIELDED)
+            if rc != 0:
+                note(f"golden refresh: `cargo {' '.join(c)}` failed ({rc}); the layer is kept as it was")
+                return record(rc)
+        pruned = golden_prune(ws, g, t0)
+        meta = golden_meta(ws) or {}
+        meta.update(_lock_fields(gdir, sha, True))
+        # the layer now also holds the list's commands (older ones stay: their units do too)
+        meta["cmds"] = list(meta.get("cmds") or []) + [" ".join(c) for c in cmds
+                                                       if " ".join(c) not in (meta.get("cmds") or [])]
+        meta.update(refreshed_at=time.strftime("%Y-%m-%dT%H:%M:%S"), refreshed_from=ws.root,
+                    refresh_seconds=round(time.time() - t0, 1))
+        write_json_atomic(os.path.join(gdir, GOLDEN_META), meta)
+        note(f"golden refresh: done in {time.time() - t0:.0f}s (pruned {pruned}); layer covers Cargo.lock {sha}")
+        return record(0)
+    finally:
+        if bfd is not None:
+            os.close(bfd)
+        if heavy is not None:
+            heavy.release()
+        os.close(rfd)
+
+
+def _run_yielding(cmd, cwd, env, heavy):
+    """Run cmd in its own process group; stop it (SIGINT, then SIGKILL) as
+    soon as a lead build waits for the heavy lock. REFRESH_YIELDED if so."""
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, start_new_session=True)
+    yielded = False
+    while True:
+        try:
+            return_code = p.wait(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if heavy is not None and not yielded and heavy.lead_waiting():
+            yielded = True
+            try:
+                os.killpg(p.pid, signal.SIGINT)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=float(os.environ.get("RBK_YIELD_KILL_S", "5")))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+    return REFRESH_YIELDED if yielded else return_code
+
+
+def file_sha(p):
+    try:
+        return hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def golden_prune(ws, g, since):
+    """Keep only the dependency layer: drop our own crates (and what depends
+    on them), top-level binaries, incremental dirs and timing reports. Units
+    of older Cargo.lock states stay until `rbk golden rm` + build (a unit's
+    fingerprint dir is named after its package, its files after its lib, so
+    "unused" can't be judged per file safely)."""
+    n = 0
+    for pdir in profile_dirs(g):
+        for e in _listdir(pdir):
+            p = os.path.join(pdir, e)
+            if e in (".fingerprint", "build", "deps", ".cargo-lock"):
+                continue
+            rm(p)
+            n += 1
+        for sub in (".fingerprint", "build"):
+            sd = os.path.join(pdir, sub)
+            for e in _listdir(sd):
+                u = unit_of(e)
+                if not u or not seedable(ws, u[0]):
+                    rm(os.path.join(sd, e))
+                    n += 1
+        ok = seedable_hashes(ws, pdir)
+        for e in _listdir(os.path.join(pdir, "deps")):
+            u = unit_of(e)
+            if not u or u[1] not in ok:
+                rm(os.path.join(pdir, "deps", e))
+                n += 1
+    for e in _listdir(g):
+        if e not in (".rustc_info.json", "CACHEDIR.TAG", USED_FILE) and not os.path.isdir(os.path.join(g, e)):
+            rm(os.path.join(g, e))
+        elif e in ("cargo-timings", "tmp", "cxxbridge", "doc"):
+            rm(os.path.join(g, e))
+    return n
+
+
+def golden_status(ws):
+    g = ws.golden_target
+    gdir = os.path.dirname(g)
+    try:
+        meta = json.load(open(os.path.join(gdir, GOLDEN_META)))
+    except (OSError, ValueError):
+        print(f"golden: none at {g}\n  build it once per session: rbk golden build")
+        return 0
+    size = unique_bytes([g]) if os.path.isdir(g) else 0
+    nunits = len(fp_units(g)) if os.path.isdir(g) else 0
+    ginos = inodes([g]) if os.path.isdir(g) else set()
+    linked = 0
+    for _, t in ws.sibling_targets():
+        for f in walk_files(os.path.join(t)):
+            try:
+                st = os.lstat(f)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) in ginos:
+                linked += 1
+    print(f"golden: {g}")
+    print(f"  built {meta.get('built_at')} from {meta.get('from')} ({meta.get('branch')}) in "
+          f"{meta.get('seconds')}s{'' if meta.get('rc') == 0 else ' -- FAILED, rc ' + str(meta.get('rc'))}")
+    for c in meta.get("cmds", []):
+        print(f"    cargo {c}")
+    print(f"  {nunits} dependency units, {human(size)}; {linked} files hardlinked into worktree targets")
+    if meta.get("env"):
+        print("  env: " + ", ".join(f"{k}={v}" for k, v in meta["env"].items()))
+    if not golden_want(ws, meta)[0]:
+        st = _refresh_state(gdir)
+        print("  note: this worktree's Cargo.lock or golden list differs from what it was built with; the next successful "
+              "`rbk cargo` refreshes it in the background (RBK_GOLDEN_AUTO=0: off; now: `rbk golden refresh`)"
+              + (f"; last refresh: rc {st.get('rc')} at {time.strftime('%H:%M', time.localtime(st.get('at', 0)))}"
+                 if st else ""))
+    if meta.get("refreshed_at"):
+        print(f"  refreshed {meta['refreshed_at']} from {meta.get('refreshed_from')} in {meta.get('refresh_seconds')}s")
+    if golden_busy(g):
+        print("  (a golden build is running now; seeds skip it until it finishes)")
+    return 0
+
+
+# --------------------------------------------------------------- du/doctor
+def cmd_du(argv):
+    ws = Workspace()
+    targets, seen = [], set()
+    for r, t in ws.sibling_targets():
+        if os.path.realpath(t) not in seen:
+            seen.add(os.path.realpath(t))
+            targets.append((r, t))
+    g = ws.golden_target
+    ginos = inodes([g]) if os.path.isdir(g) else set()
+    for r, t in targets:
+        label = r if os.path.realpath(t) == os.path.realpath(os.path.join(r, "target")) else f"{r}  ({t})"
+        print(f"{human(unique_bytes([t], ginos)):>8}  {label}")
+    if ginos:
+        print(f"{human(unique_bytes([g])):>8}  golden layer {g} (never swept; its bytes are not counted above)")
+    print(f"{human(unique_bytes([t for _, t in targets] + ([g] if ginos else []))):>8}  "
+          f"total (hardlinks counted once{', golden included' if ginos else ''})")
+    return 0
+
+
+def cmd_doctor(argv):
+    print(f"rbk doctor")
+    v = subprocess.run(["cargo", "-V"], capture_output=True, text=True).stdout.strip()
+    print(f"  cargo: {v}")
+    try:
+        ws = Workspace()
+        nlocal = len({n.replace("_", "-") for n in ws.local_names})
+        print(f"  workspace: {ws.root}  (local packages: {nlocal}; registry packages built on them, "
+              f"never seeded: {len({n.replace('_', '-') for n in ws.tainted})})")
+        print(f"  target: {ws.target}")
+        st = os.statvfs(ws.root)
+        print(f"  free disk: {human(st.f_bavail * st.f_frsize)}")
+        fs = subprocess.run(["df", "-T", ws.root], capture_output=True, text=True).stdout.splitlines()[-1].split()[1] \
+            if sys.platform.startswith("linux") else "?"
+        print(f"  filesystem: {fs}")
+        print(f"  sibling worktrees with targets: {len(ws.sibling_targets())}")
+        g = golden_usable(ws)
+        print(f"  golden layer: {g or 'none (rbk golden build)'}")
+        shared = ws.shared_with()
+        if shared:
+            print(f"  WARNING: this target dir is also the target of {', '.join(shared)}")
+    except SystemExit:
+        pass
+    for k in ("RUSTC_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_INCREMENTAL", "RBK_PRIORITY"):
+        if os.environ.get(k):
+            print(f"  {k}={os.environ[k]}")
+    if os.environ.get("CARGO_TARGET_DIR") or os.environ.get("CARGO_BUILD_BUILD_DIR"):
+        print("  note: a CARGO_TARGET_DIR is fine if only this worktree uses it (rbk registers it, seeds it "
+              "and warns if another worktree builds into it); a target/build dir shared between worktrees "
+              "can link another worktree's code (workspace crates hash identically across worktrees).")
+    lp = os.environ.get('RBK_LOCK') or default_lock()
+    who = lock_holder(lp) if lp != "off" else ""
+    print(f"  lock: {lp}{'  (held by ' + who + ')' if who else ''}")
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, argv = sys.argv[1], sys.argv[2:]
+    if cmd == "cargo":
+        return cmd_cargo(argv)
+    if cmd == "seed":
+        return cmd_seed(argv)
+    if cmd == "golden":
+        return cmd_golden(argv)
+    if cmd == "sweep":
+        return cmd_sweep(argv)
+    if cmd == "du":
+        return cmd_du(argv)
+    if cmd == "doctor":
+        return cmd_doctor(argv)
+    if cmd == "timings":
+        return cmd_timings(argv)
+    die(f"unknown command {cmd!r} (see rbk --help)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
