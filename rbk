@@ -151,6 +151,11 @@ def write_json_atomic(path, data):
 # ----------------------------------------------------------------- workspace
 def cargo_json(args, cwd):
     r = subprocess.run(["cargo", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0 and "--offline" in args and "--offline was specified" in r.stderr:
+        # Fresh container: a crate of another target (android-activity, ...) was never
+        # downloaded, so offline metadata cannot resolve. Go online once; it fetches it.
+        online = [a for a in args if a != "--offline"]
+        r = subprocess.run(["cargo", *online], cwd=cwd, capture_output=True, text=True)
     if r.returncode != 0:
         die(f"cargo {' '.join(args)} failed:\n{r.stderr[-2000:]}")
     return json.loads(r.stdout)

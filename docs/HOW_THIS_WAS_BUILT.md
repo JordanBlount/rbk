@@ -59,6 +59,8 @@ nothing fits.
 - Sept 29: survey, measurements, first `rbk` (seed, lock, track, sweep).
 - Sept 30: deadlock fix, load test, six bugs fixed, golden layer, lock queue.
 - Oct 1: unit-by-unit consistent seeding, background golden refresh.
+- Oct 13: a fresh container no longer fails when offline `cargo metadata`
+  hits a crate it never downloaded; rbk goes online once instead.
 
 ## Honest limits
 

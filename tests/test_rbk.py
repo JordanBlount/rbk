@@ -76,6 +76,37 @@ def fake_profile(target, units=20, size=64 * 1024, prof="debug"):
     return pdir
 
 
+class OfflineMetadataTest(unittest.TestCase):
+    """A fresh container has not downloaded crates of other targets (android-activity),
+    so `cargo metadata --offline` fails; rbk must go online once instead of dying
+    (2026-10-13: `rbk golden build` failed this way on a new container)."""
+
+    def test_offline_miss_retries_online(self):
+        mod = rbk_module()
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if "--offline" in cmd:
+                return types.SimpleNamespace(returncode=101, stdout="",
+                    stderr="error: failed to download `android-activity v0.6.1`\n\nCaused by:\n"
+                           "  attempting to make an HTTP request, but --offline was specified")
+            return types.SimpleNamespace(returncode=0, stdout='{"ok": 1}', stderr="")
+
+        with mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(mod.cargo_json(["metadata", "--offline"], "."), {"ok": 1})
+        self.assertEqual(calls, [["cargo", "metadata", "--offline"], ["cargo", "metadata"]])
+
+    def test_other_offline_failures_still_die(self):
+        mod = rbk_module()
+        bad = types.SimpleNamespace(returncode=101, stdout="", stderr="error: could not find `Cargo.toml`")
+        with mock.patch.object(mod.subprocess, "run", return_value=bad), \
+                mock.patch.object(mod, "die", side_effect=SystemExit) as die:
+            with self.assertRaises(SystemExit):
+                mod.cargo_json(["metadata", "--offline"], ".")
+            die.assert_called_once()
+
+
 class SymlinkedTargetTest(unittest.TestCase):
     """2026-09-30: with <root>/target a symlink to CARGO_TARGET_DIR, the sweep
     saw the same target dir under two paths, flock'ed its .cargo-lock through
